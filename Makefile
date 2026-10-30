@@ -1,6 +1,6 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -std=c11
-PREFIX  ?= /usr/local
+PREFIX  ?= /usr
 BINDIR  ?= $(PREFIX)/bin
 
 .PHONY: all clean install

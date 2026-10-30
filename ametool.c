@@ -185,6 +185,82 @@ static int parse_dk_b64(const char *s, uint8_t out[DK_LENGTH])
 	return 0;
 }
 
+static void encode_dk_b64(const uint8_t in[DK_LENGTH], char out[45])
+{
+	static const char tbl[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	int i, o = 0;
+
+	for (i = 0; i < DK_LENGTH; i += 3) {
+		uint32_t v = ((uint32_t)in[i] << 16);
+		if (i + 1 < DK_LENGTH)
+			v |= ((uint32_t)in[i + 1] << 8);
+		if (i + 2 < DK_LENGTH)
+			v |= in[i + 2];
+		out[o++] = tbl[(v >> 18) & 63];
+		out[o++] = tbl[(v >> 12) & 63];
+		out[o++] = (i + 1 < DK_LENGTH) ? tbl[(v >> 6) & 63] : '=';
+		out[o++] = (i + 2 < DK_LENGTH) ? tbl[v & 63] : '=';
+	}
+	out[o] = '\0';
+}
+
+static int read_random(void *buf, size_t n)
+{
+	int fd = open("/dev/random", O_RDONLY);
+	uint8_t *p = buf;
+	size_t got = 0;
+
+	if (fd < 0) {
+		perror("/dev/random");
+		return -1;
+	}
+	while (got < n) {
+		ssize_t r = read(fd, p + got, n - got);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("read /dev/random");
+			close(fd);
+			return -1;
+		}
+		if (r == 0) {
+			fprintf(stderr, "/dev/random: unexpected EOF\n");
+			close(fd);
+			return -1;
+		}
+		got += (size_t)r;
+	}
+	close(fd);
+	return 0;
+}
+
+/*
+ * DKi: fixed "IBM" prefix + 9 random bytes as hex.
+ * DK: 32 random bytes, printed as base64.
+ */
+static int generate_and_print_keys(void)
+{
+	uint8_t dki[DKI_LENGTH];
+	uint8_t dk[DK_LENGTH];
+	uint8_t rnd[(DKI_LENGTH - DKI_ASCII) + DK_LENGTH];
+	char dki_txt[22];
+	char dk_txt[45];
+
+	if (read_random(rnd, sizeof(rnd)) < 0)
+		return -1;
+
+	memcpy(dki, "IBM", DKI_ASCII);
+	memcpy(dki + DKI_ASCII, rnd, DKI_LENGTH - DKI_ASCII);
+	memcpy(dk, rnd + (DKI_LENGTH - DKI_ASCII), DK_LENGTH);
+
+	format_dki(dki, dki_txt);
+	encode_dk_b64(dk, dk_txt);
+	printf("DKi: %s\n", dki_txt);
+	printf("DK:  %s\n", dk_txt);
+	return 0;
+}
+
 static int sense_is_unit_attention(const uint8_t *sense, int len)
 {
 	if (len < 3)
@@ -519,8 +595,8 @@ static void print_status(const struct ame_status *st)
 		printf("Drive key mode: ENCRYPT=%s DECRYPT=%s alg=0x%02X\n",
 		       enc_mode_name(st->enc_mode), dec_mode_name(st->dec_mode),
 		       st->drv_alg);
-		printf("Volume has encrypted data (VCELB): %s\n",
-		       st->vcelb ? "yes" : "no / unknown");
+		printf("Has enc. data:  %s\n",
+		       st->vcelb ? "yes (VCELB=1)" : "no / unknown (VCELB=0)");
 		if (st->have_dki) {
 			format_dki(st->dki, dki_txt);
 			printf("Loaded DKi:     %s\n", dki_txt);
@@ -626,6 +702,7 @@ static int prompt_keys(uint8_t dki[DKI_LENGTH], uint8_t dk[DK_LENGTH])
 		return -1;
 	if (parse_dki(dki_buf, dki) < 0 || parse_dk_b64(dk_buf, dk) < 0)
 		return -1;
+	printf("\n");
 	return 0;
 }
 
@@ -633,26 +710,30 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"Usage:\n"
+		"  %s --generate\n"
 		"  %s <sg-device> --status\n"
-		"  %s <sg-device> [--dki DKi] [--dk DK] [--no-ckod] [--alg N] [--force]\n"
+		"  %s <sg-device> --set [--dki DKi] [--dk DK] [--no-ckod] [--alg N] [--force]\n"
 		"  %s <sg-device> --clear [--no-ckod] [--force]\n"
 		"\n"
-		"  --status   show cartridge / AME status only\n"
-		"  --clear    clear encryption parameters on the drive\n"
-		"  --dki/--dk LTFS-style key id and base64 data key; if omitted when\n"
-		"             setting a key, prompted on stdin after status is shown\n"
-		"  --no-ckod  keep key across demount (default is CKOD=1)\n"
-		"  --force    skip AME / CFG_P refusal checks\n"
-		"  --alg N    force ALGORITHM INDEX (default: SPIN AVFMV)\n",
-		argv0, argv0, argv0);
+		"  --generate  write a new random DKi/DK pair to stdout (no device)\n"
+		"  --status    show cartridge / AME status only\n"
+		"  --set       load a key onto the drive (prompts if --dki/--dk omitted)\n"
+		"  --clear     clear encryption parameters on the drive\n"
+		"  --dki/--dk  LTFS-style key id and base64 data key (with --set)\n"
+		"  --no-ckod   keep key across demount (default is CKOD=1)\n"
+		"  --force     skip AME / CFG_P refusal checks\n"
+		"  --alg N     force ALGORITHM INDEX (default: SPIN AVFMV)\n",
+		argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv)
 {
 	const char *dki_str = NULL;
 	const char *dk_str = NULL;
+	int do_set = 0;
 	int do_clear = 0;
 	int do_status = 0;
+	int do_generate = 0;
 	int skip_check = 0;
 	int ckod = 1; /* default CKOD=1 */
 	int alg_override = -1;
@@ -660,24 +741,28 @@ int main(int argc, char **argv)
 	struct ame_status st;
 
 	static struct option opts[] = {
-		{"dki",     required_argument, 0, 'i'},
-		{"dk",      required_argument, 0, 'k'},
-		{"clear",   no_argument,       0, 'c'},
-		{"status",  no_argument,       0, 's'},
-		{"no-ckod", no_argument,       0, 'n'},
-		{"force",   no_argument,       0, 'f'},
-		{"alg",     required_argument, 0, 'a'},
-		{"help",    no_argument,       0, 'h'},
+		{"dki",      required_argument, 0, 'i'},
+		{"dk",       required_argument, 0, 'k'},
+		{"set",      no_argument,       0, 'S'},
+		{"clear",    no_argument,       0, 'c'},
+		{"status",   no_argument,       0, 's'},
+		{"generate", no_argument,       0, 'g'},
+		{"no-ckod",  no_argument,       0, 'n'},
+		{"force",    no_argument,       0, 'f'},
+		{"alg",      required_argument, 0, 'a'},
+		{"help",     no_argument,       0, 'h'},
 		{0, 0, 0, 0}
 	};
 
 	int c;
-	while ((c = getopt_long(argc, argv, "i:k:csnfa:h", opts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "i:k:Scsgnfa:h", opts, NULL)) != -1) {
 		switch (c) {
 		case 'i': dki_str = optarg; break;
 		case 'k': dk_str = optarg; break;
+		case 'S': do_set = 1; break;
 		case 'c': do_clear = 1; break;
 		case 's': do_status = 1; break;
+		case 'g': do_generate = 1; break;
 		case 'n': ckod = 0; break;
 		case 'f': skip_check = 1; break;
 		case 'a': alg_override = (int)strtol(optarg, NULL, 0); break;
@@ -688,18 +773,33 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (do_generate) {
+		if (do_set || do_clear || do_status || dki_str || dk_str) {
+			fprintf(stderr, "--generate cannot be combined with other actions\n");
+			return 1;
+		}
+		if (optind < argc) {
+			fprintf(stderr, "--generate does not take arguments\n");
+			return 1;
+		}
+		return generate_and_print_keys() == 0 ? 0 : 1;
+	}
+
+	int modes = do_set + do_clear + do_status;
+	if (modes != 1) {
+		fprintf(stderr, "exactly one of --set, --clear, or --status is required\n");
+		usage(argv[0]);
+		return 1;
+	}
+
 	if (optind >= argc) {
 		usage(argv[0]);
 		return 1;
 	}
 	const char *dev = argv[optind];
 
-	if (do_status && (do_clear || dki_str || dk_str)) {
-		fprintf(stderr, "--status cannot be combined with --clear/--dki/--dk\n");
-		return 1;
-	}
-	if (do_clear && (dki_str || dk_str)) {
-		fprintf(stderr, "--clear cannot be combined with --dki/--dk\n");
+	if (!do_set && (dki_str || dk_str)) {
+		fprintf(stderr, "--dki/--dk only valid with --set\n");
 		return 1;
 	}
 	if ((dki_str && !dk_str) || (!dki_str && dk_str)) {
@@ -749,6 +849,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Clearing encryption parameters (CKOD=%d)...\n", ckod);
 		rc = spout_set_key(fd, NULL, NULL, alg_index, ckod);
 	} else {
+		/* --set */
 		if (dki_str) {
 			if (parse_dki(dki_str, dki) < 0 || parse_dk_b64(dk_str, dk) < 0) {
 				close(fd);
@@ -771,9 +872,8 @@ int main(int argc, char **argv)
 		rc = spout_set_key(fd, dki, dk, alg_index, ckod);
 	}
 
-	if (rc == 0) {
-		fprintf(stderr, "OK\n\n");
-	}
+	if (rc == 0)
+		fprintf(stderr, "OK\n");
 
 	close(fd);
 	return rc == 0 ? 0 : 1;
